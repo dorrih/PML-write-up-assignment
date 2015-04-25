@@ -1,0 +1,134 @@
+---
+title: "Write up Assignment"
+author: "Dorri"
+date: "Saturday, April 25, 2015"
+output: html_document
+---
+
+I started by loading the data. From examining the data I saw that there are cells with *NA*, empty cells, and cells with *#DIV/0!*, which should all be considered as *NA*:
+```{r}
+full_training_data<-read.csv("pml-training.csv",na.strings=c("NA","NaN","","#DIV/0!"))
+```
+First, I divided the training database into a training set and a cross validation set:
+```{r}
+require("caret")
+require("kernlab")
+require("doParallel")
+set.seed(1263)
+inTrain<-createDataPartition(y=full_training_data$"classe",p=0.75,list=FALSE)
+
+training<-full_training_data[inTrain,]
+nam<-names(training)
+y<-training$"classe"
+
+CV<-full_training_data[-inTrain,]
+yCV<-CV$"classe"
+```
+I specified the numeric data column, and stored them into a separate data.frame:
+```{r}
+sen_range<-c(8:158)
+sensor_data<-training[,sen_range]
+CV_sensor_data<-CV[,sen_range]
+
+sens_nam<-nam[sen_range]
+```
+
+Next, I examined the sparsity of the data, and took a few diagnostics indicating the density of *NA* values, so that I could make a decision regarding the data imputation strategy:
+```{r}
+rcomplete<-complete.cases(sensor_data)
+sensor_data.comp<-sensor_data[rcomplete,]
+
+countna_func<-function(x) { return(length(which(is.na(x))))}
+count_na<-lapply(sensor_data,countna_func)
+
+r_na<-which(count_na>0.9*nrow(sensor_data))
+sensor_data.comp<-sensor_data[complete.cases(sensor_data),]
+
+r<-range(as.numeric(count_na[r_na]))
+```
+
+There are `r as.character(length(r_na))`, sensor columns which contain mostly empty cells, of which the number of empty cells ranges between `r as.character(r[1])` and `r as.character(r[2])`. In these the std of missing data number is `r as.character(round(sd(as.numeric(count_na[r_na]))))`. 
+The total number of *NA* outside this group is `r as.character(sum(as.numeric(count_na[-r_na])))`.
+There are exactly `r as.character(nrow(sensor_data.comp))` complete cases, and the total number of observations is `r as.character(nrow(sensor_data))`. At the Bottom line, we can omit each sensor which has *NA*, without losing meaninful variance of the data in this case. 
+```{r}
+sensor_data.imputed<-sensor_data[-r_na]
+nam.imputed<-names(sensor_data.imputed)
+
+CV_sensor_data.imputed<-CV_sensor_data[-r_na]
+
+m<-length(nam.imputed)
+n<-nrow(sensor_data.imputed)
+```
+We are left with `r as.character(n) ` observations and `r as.character(m) ` sensors which we are going to use for the training sessions.
+Next I wanted to get a better understanding of the distribution of variance in the data, so I looked the the principle component analysis of the data:
+```{r}
+sensor_data.pca<-prcomp(sensor_data.imputed,center=TRUE,scale.=TRUE)
+tot<-sum(sensor_data.pca$"sdev"^2)
+Cumulative_proportion<-numeric(m); toti<-0
+for(i in 1:m){ toti<-toti+sensor_data.pca$"sdev"[i]^2; Cumulative_proportion[i]<-toti/tot}
+qplot(c(1:m),Cumulative_proportion,xlab="Number of components",ylab="Cumulative proportion",ylim=c(0,1),xlim=c(0,m))
+```
+
+One needs `r as.character(which(Cumulative_proportion>=0.95)[1])` components to get 95% of the variance, which is a large portion of the components of the problem. So we reach the conclusion that the variance is distributed and not local, and we will not attempt any further dimensionality reduction.
+Next I attempted a linear SVM classifier:
+
+```{r}
+  Ntrain_vect<-c(100,200,500,1000,2000,5000,n)
+
+  trControl<-trainControl(method = 'cv', number = 5, allowParallel = TRUE)
+  model_list1<-list()
+  SVMTrainingAccuracy_vect<-numeric(length(Ntrain_vect))
+  SVMCVAccuracy_vect<-numeric(length(Ntrain_vect))
+
+	for(i in 1:length(Ntrain_vect)){
+		rtrain<-sample(1:n, Ntrain_vect[i])
+    xi<-sensor_data.imputed[rtrain,]
+    yi<-y[rtrain]
+		mod.SVM<-train(x=xi,y=yi, method="svmLinear",preProcess = c('center', 'scale'), trControl=trControl)
+    model_list1[[length(model_list1)+1]]<-mod.SVM
+    vCV<-predict(mod.SVM,CV_sensor_data.imputed)
+    CM_CV<-confusionMatrix(vCV,yCV)
+    SVMCVAccuracy_vect[i]<-CM_CV$"overall"[["Accuracy"]]
+	  SVMTrainingAccuracy_vect[i]<-mod.SVM$"results"[["Accuracy"]]
+	}
+  df<-data.frame(Ntrain_vect,SVMTrainingAccuracy_vect,SVMCVAccuracy_vect)
+  ggplot(df, aes(x=df$Ntrain_vect))+scale_x_log10() +  
+		    geom_line(aes(x=df$Ntrain_vect,y = SVMCVAccuracy_vect, col = 'Cross Validation'))+
+		    geom_line(aes(y = SVMTrainingAccuracy_vect, col = 'Training'))+
+        xlab("Training set size")+ylab("Accuracy")+labs(title="Linear SVM performance")
+  CM_CV<-confusionMatrix(predict(model_list1[[length(model_list1)]],CV_sensor_data.imputed),yCV)
+  CM_CV["table"]
+```
+  
+  This way an accuracy of about 80% was reached on the cross validation group. At this point I suspected that perhaps I could improve the performance if I treat this problem as a regression problem other than a classification problem. Since if the classe for a given observation is, for example, "B" and the prediction is "A" it should be regarded as a better prediction than if it was "D". So I performed another attempt with SVM, this time I treated the classe field as a number in 1:5, and attempted to minimize the RMSE. However, this attempt gave inferior results to the previous attempt, of the order 50% accuracy after training over almost 15000 cases.
+  The accuracy we got so far is not satisfactory, so I searched for an alternative method, and decided to attempt a random forest algorithm, using the randomForest forest package.
+  
+```{r}
+  require("randomForest")
+  RFCVAccuracy_vect<-numeric(length(Ntrain_vect))
+  RFTrainingAccuracy_vect<-numeric(length(Ntrain_vect))
+  model_list3<-list()
+  tpgrid<-expand.grid(mtry=c(7)) #approximately sqrt(m)
+  trControl<-trainControl(method = 'cv', number = 5, allowParallel = TRUE)
+	for(i in 1:length(Ntrain_vect)){
+		rtrain<-sample(1:n, Ntrain_vect[i])
+    xi<-sensor_data.imputed[rtrain,]
+    yi<-y[rtrain]
+    
+    mod.RF<-train(x=xi,y=yi, method="rf", trControl=trControl,tuneGrid=tpgrid)
+	  model_list3[[length(model_list3)+1]]<-mod.RF
+    vCV<-predict(mod.RF,CV_sensor_data.imputed)
+    CM_CV<-confusionMatrix(vCV,yCV)
+	  RFTrainingAccuracy_vect[i]<-model_list3[[i]]$"results"[["Accuracy"]]
+    RFCVAccuracy_vect[i]<-CM_CV$"overall"[["Accuracy"]]
+	}
+  df<-data.frame(Ntrain_vect,RFTrainingAccuracy_vect,RFCVAccuracy_vect)
+  ggplot(df, aes(x=df$Ntrain_vect))+scale_x_log10() +  
+		    geom_line(aes(x=df$Ntrain_vect,y = RFCVAccuracy_vect, col = 'Cross Validation'))+
+		    geom_line(aes(y = RFTrainingAccuracy_vect, col = 'Training'))+
+        xlab("Training set size")+ylab("Accuracy")+labs(title="Random Forest performance")
+  CM_CV<-confusionMatrix(predict(model_list3[[length(model_list3)]],CV_sensor_data.imputed),yCV)
+  CM_CV["table"]
+```
+
+This approach proved to be very successful with an accuracy rate of about 99% over the ~5000 cross-validation cases after training over the ~15000 training cases. This success rate is way beyond what I expected to get from a predicitive model after examining the data, and searching for patterns, so I believe this would be considered a successful learning case.
